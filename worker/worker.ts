@@ -171,6 +171,15 @@ export function createWorker({
       }
     });
 
+  /** What one part of a round does wrong is logged, not thrown: the rest of the round still happens. */
+  async function guard(what: string, work: () => void | Promise<void>) {
+    try {
+      await work();
+    } catch (error) {
+      log(`${what}: ${error}`);
+    }
+  }
+
   /** Starts a turn of the agent: a process that outlives this one, leaving its output and exit code in files. */
   function launch(entry: Entry, adapter: Adapter, prompt: string) {
     entry.turn += 1;
@@ -232,7 +241,6 @@ export function createWorker({
 
   async function start(job: Job) {
     const dir = path.join(RUNS, `${job.run}-${job.attempt}`);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
     const entry: Entry = {
       run: job.run,
       token: job.token,
@@ -246,16 +254,36 @@ export function createWorker({
       repairs: 0,
       triedFresh: false,
     };
-    // Kept before anything slow: a worker stopped from here on still has the job.
-    save(entry);
     try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      // Kept before anything slow: a worker stopped from here on still has the job.
+      save(entry);
       writeFileSync(path.join(dir, "context.json"), JSON.stringify(job.context, null, 2), { mode: 0o600 });
       const adapter = await adapterFor(job.agent.use);
       entry.prompt = promptFor(job, path.join(dir, "context.json"));
       save(entry);
       launch(entry, adapter, entry.prompt);
     } catch (error) {
-      endWith(entry, { outcome: "failed", error: String((error as Error).message ?? error).slice(0, 500) });
+      // The run is the hub's to retry: say it failed rather than let it hang claimed with nothing here.
+      log(`run ${job.run}: couldn't start it here: ${error}`);
+      const failure = { outcome: "failed" as const, error: String((error as Error).message ?? error).slice(0, 500) };
+      try {
+        endWith(entry, failure);
+      } catch {
+        // Not even its failure could be written down; say it straight to the hub while it can still be heard.
+        try {
+          const answer = await hub.result(job.run, job.token, failure);
+          for (const item of answer?.rejected ?? []) log(`run ${job.run}: not applied: ${JSON.stringify(item)}`);
+          // A half-written entry with turn 0 would be launched again next round; the hub has already taken this.
+          try {
+            unlinkSync(path.join(entry.dir, "entry.json"));
+          } catch (removing) {
+            log(`run ${job.run}: couldn't clear its entry after saying it failed: ${removing}`);
+          }
+        } catch (giving) {
+          log(`run ${job.run}: couldn't even say it failed: ${giving}`);
+        }
+      }
     }
   }
 
@@ -406,9 +434,9 @@ export function createWorker({
       for (const item of answer?.rejected ?? []) log(`run ${entry.run}: not applied: ${JSON.stringify(item)}`);
       log(`run ${entry.run}: ${entry.result.outcome}`);
     } catch (error) {
-      if (!(error instanceof HubError) || error.status >= 500) {
-        return log(`run ${entry.run}: couldn't hand in the result: ${error}`);
-      }
+      // A refusal is final; a busy, timed-out or rate-limited hub (or none at all) will take it next time.
+      const again = !(error instanceof HubError) || error.status >= 500 || [408, 425, 429].includes(error.status);
+      if (again) return log(`run ${entry.run}: couldn't hand in the result: ${error}`);
       log(`run ${entry.run}: the hub refused its result (${error.status}: ${error.message}); dropped`);
     }
     unlinkSync(path.join(entry.dir, "entry.json"));
@@ -442,8 +470,9 @@ export function createWorker({
 
   /** One round: look at what's in hand, hand in what's ended, come for more. Whether the hub could be reached. */
   async function tick() {
-    for (const entry of entries()) await check(entry);
-    for (const entry of entries()) await settle(entry);
+    // One broken entry or one bad folder must not stop the others being looked at or the hub being come to.
+    for (const entry of entries()) await guard(`run ${entry.run}`, () => check(entry));
+    for (const entry of entries()) await guard(`run ${entry.run}`, () => settle(entry));
     const held = entries();
     let reachable = true;
     try {

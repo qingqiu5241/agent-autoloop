@@ -111,11 +111,14 @@ export let rules = query.configuration(current);
 let loaded = { file: "", mtime: 0 };
 
 export function reloadRules(file = RULES_FILE) {
-  const mtime = statSync(file).mtimeMs;
-  if (loaded.file === file && loaded.mtime === mtime) return { changed: false };
-  loaded = { file, mtime };
+  let mtime: number;
   try {
-    const next = parseRules(readFileSync(file, "utf8"));
+    mtime = statSync(file).mtimeMs;
+    if (loaded.file === file && loaded.mtime === mtime) return { changed: false };
+    const text = readFileSync(file, "utf8");
+    // Only a read that got through counts as seen: a failure here must be tried again next time.
+    const next = parseRules(text);
+    loaded = { file, mtime };
     const differs = JSON.stringify(next) !== JSON.stringify(query.configuration(getView()));
     const reportedBroken = (card: Row) => card.key.startsWith("rules:") && card.state === "open";
     if (differs || rows(current, "cards", { state: "open" }).some(reportedBroken)) execute("rules", [next]);
@@ -123,6 +126,10 @@ export function reloadRules(file = RULES_FILE) {
     return { changed: true };
   } catch (error) {
     if (error instanceof RulesError) return { changed: false, problem: error.message };
+    // A file that can't be found or read right now (an editor's atomic save is the usual reason) is waited out:
+    // the old rules keep running and this is not a mistake in the file, so no "rules.json 写错了" card.
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT")
+      return { changed: false, problem: "暂时读不到 rules.json，沿用它改动前的样子" };
     throw error;
   }
 }
@@ -155,7 +162,8 @@ export const sweep = (now = Date.now()) => execute("sweep", [], now);
 
 export function tick(now = Date.now()) {
   const { problem } = reloadRules();
-  if (problem) execute("rulesError", [problem], now);
+  // A file that isn't there for a moment is not a mistake in it: no card, it waits for the file to come back.
+  if (problem && !problem.startsWith("暂时读不到")) execute("rulesError", [problem], now);
   execute("tick", [], now);
 }
 

@@ -191,11 +191,13 @@ function heldRun(draft: Draft, id: number, token: string, states: string[]) {
 }
 
 function cardFromReceipt(draft: Draft, run: Row, kind: string, card: Row) {
+  // A question and a piece of news with the same words are not the same card: the kind tells them apart, so one can't
+  // swallow the other by sharing a key.
   const name = card.key ?? digest(`${card.title}\n${card.text}`).slice(0, 32);
   const session = draft.view.get("runs", run.id)!.session;
   const quiet = kind === "notice" && ruleNamed(draft, run.rule)?.tell === "never";
   const origin = { source: sourceOf(draft.view, run.id), agent: run.agent, session, run: run.id };
-  const key = `thread:${run.rule}:${run.lane}:${name}`;
+  const key = `thread:${run.rule}:${run.lane}:${name}:${kind}`;
   createCard(draft, { ...card, hops: hopsOf(draft, run), key, kind, quiet, ...threadOf(run), ...origin });
 }
 
@@ -279,7 +281,7 @@ function retryLater(draft: Draft, run: Row, result: Result) {
     for (const _ of result[what] ?? []) rejected.push({ what, reason: "没跑成的一轮只能发通知" });
   }
   for (const notice of result.notice ?? []) cardFromReceipt(draft, run, "notice", notice);
-  if (!result.notice?.length && attempts === 3) {
+  if (attempts === 3) {
     const clock = { timeZone: draft.rules.timezone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" } as const;
     const time = new Intl.DateTimeFormat("zh-CN", clock).format(notBefore);
     const words = `连续 3 次自动处理没跑完（卡在：${error}），${time} 会自动再试。`;
@@ -312,8 +314,6 @@ function applyReceipt(draft: Draft, run: Row, result: Result) {
   const summary = result.summary ?? "";
   const rejected: Rejected[] = [];
   put(draft, "runs", id, { state: result.outcome, finished_at: draft.at, summary, error: null, cancel_at: null });
-  closeOpen(draft, (key) => key === `run:${id}:failing`, "后来跑成了");
-  closeOpen(draft, (key) => key === `run:${id}:unknown`, "结果回来了");
   const eventIds = eventsOf(draft.view, id).map((event) => event.id);
   const isAnswered = (card: Row) => card.state === "decided" && eventIds.includes(card.answer_event);
   for (const card of rows(draft.view, "cards", { answer_event: eventIds, state: "decided" }).filter(isAnswered)) {
@@ -356,14 +356,19 @@ function finish(draft: Draft, id: number, token: string, given: unknown) {
   put(draft, "runs", id, { last_issued: run.issued, last_result: hash, issued: null, session, usage });
   let rejected: Rejected[] = [];
   if (result.outcome === "failed") rejected = retryLater(draft, run, result);
-  else if (result.outcome === "cancelled") {
-    put(draft, "runs", id, {
-      state: "cancelled",
-      finished_at: draft.at,
-      summary: result.summary ?? "",
-      cancel_at: null,
-    });
-  } else rejected = applyReceipt(draft, run, result);
+  else {
+    // Any ending closes what this run had been telling the owner about itself.
+    closeOpen(draft, (key) => key === `run:${id}:failing`, result.outcome === "cancelled" ? "已取消" : "后来跑成了");
+    closeOpen(draft, (key) => key === `run:${id}:unknown`, "结果回来了");
+    if (result.outcome === "cancelled") {
+      put(draft, "runs", id, {
+        state: "cancelled",
+        finished_at: draft.at,
+        summary: result.summary ?? "",
+        cancel_at: null,
+      });
+    } else rejected = applyReceipt(draft, run, result);
+  }
   put(draft, "runs", id, { last_answer: JSON.stringify(rejected) });
   return { rejected };
 }
@@ -504,9 +509,26 @@ const HANDLERS: Record<string, (draft: Draft, ...args: any[]) => unknown> = {
   cancel(draft, id) {
     const run = draft.view.get("runs", id);
     if (!run) throw new NotFound("没有这一轮");
-    if (run.state === "queued") put(draft, "runs", id, { state: "cancelled", finished_at: draft.at });
-    else if (run.state === "claimed") put(draft, "runs", id, { cancel_at: draft.at });
-    else throw new InputError("这一轮已经结束了");
+    // Called off while nobody can vouch for it: there is nothing left to wait for.
+    const ended = {
+      state: "cancelled",
+      finished_at: draft.at,
+      cancel_at: null,
+      issued: null,
+      claim: null,
+      seen_at: null,
+    };
+    if (run.state === "queued") {
+      put(draft, "runs", id, { ...ended });
+      closeOpen(draft, (key) => key === `run:${id}:failing`, "已取消");
+      closeOpen(draft, (key) => key === `run:${id}:unknown`, "本人等不到结果，已取消");
+    } else if (run.state === "claimed") put(draft, "runs", id, { cancel_at: draft.at });
+    else if (run.state === "unknown") {
+      put(draft, "runs", id, { ...ended });
+      // It may well have been failing before it went quiet: that promise of a retry ends here too.
+      closeOpen(draft, (key) => key === `run:${id}:failing`, "已取消");
+      closeOpen(draft, (key) => key === `run:${id}:unknown`, "本人等不到结果，已取消");
+    } else throw new InputError("这一轮已经结束了");
   },
   resolve(draft, id, reason, by) {
     const card = draft.view.get("cards", id);

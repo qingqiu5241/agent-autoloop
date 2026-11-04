@@ -99,6 +99,8 @@ export function makeHandler(commit = "dev") {
     hub.tick();
     arm();
   });
+  // A watched folder can vanish, or the system can run out of watchers: losing hot reload is not losing the hub.
+  watcher.on("error", (error) => console.error(`rules watcher stopped: ${error}`));
   const handle = createHandler({
     commit,
     now: Date.now,

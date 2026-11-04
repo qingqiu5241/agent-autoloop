@@ -13,6 +13,9 @@
 // A shell replacing itself with the final move must not lose its identity before the exit file is published.
 // A failed or timed-out receipt repair must preserve the original business outcome; cancellation must reap a child
 // ignoring SIGTERM even after restart; adding usage must not turn a missing price into a reported zero.
+// A job that can't even be written down comes back failed, not lost with the hub still waiting on it; a busy or
+// rate-limited hub's refusal to take a result is waited out, not dropped; one broken entry in a round doesn't stop
+// the others being checked or the hub being come to.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -95,6 +98,7 @@ function fakeHub() {
     claims: [] as any[],
     failResults: 0,
     refuseResults: false,
+    refuseStatus: 401,
     down: false,
     async work(query: any) {
       if (hub.down) throw new Error("connect ECONNREFUSED");
@@ -108,7 +112,7 @@ function fakeHub() {
       return { ok: true };
     },
     async result(run: number, token: string, body: any) {
-      if (hub.refuseResults) throw new HubError(401, "这件活不归这个令牌");
+      if (hub.refuseResults) throw new HubError(hub.refuseStatus, "试一下再说");
       if (hub.failResults > 0) {
         hub.failResults -= 1;
         throw new Error("network down");
@@ -552,4 +556,78 @@ test("the hub gone for ten minutes is told once, tried a few times if telling fa
   clock += 11 * 60_000;
   for (let i = 0; i < 8; i++) await f.tick();
   assert.equal(readFileSync(attempts, "utf8").trim().split("\n").length, 5);
+});
+
+test("a job that can't be written down comes back failed instead of hanging claimed", async () => {
+  const hub = fakeHub();
+  // The rule's folder isn't there, so launching fails after the entry is kept — the easy case. The hard case is the
+  // runs folder itself being unwritable, so make the run's directory impossible to create.
+  const given = job();
+  const runs = join(home, "worker", "runs");
+  const blocked = join(runs, `${given.run}-1`);
+  // A file where the directory should be makes mkdir fail.
+  writeFileSync(blocked, "");
+  hub.jobs.push(given);
+  const lines: string[] = [];
+  const w = worker(hub, { log: (line: string) => lines.push(line) });
+  await w.tick();
+  assert.ok(
+    hub.results.some((r) => r.run === given.run && r.outcome === "failed"),
+    "the hub hears it couldn't start here",
+  );
+  assert.equal(w.entries().length, 0, "nothing is left hanging locally");
+});
+
+test("a busy or rate-limited hub's refusal is waited out, while a rejection is dropped", async () => {
+  const busy = fakeHub();
+  busy.refuseResults = true;
+  busy.refuseStatus = 429;
+  busy.jobs.push(job());
+  const lines: string[] = [];
+  const w = worker(busy, { log: (line: string) => lines.push(line) });
+  await until(w, () => lines.some((l) => l.includes("couldn't hand in")));
+  assert.equal(w.entries().length, 1, "the result stays for the next round");
+  // The same hub turning the result away for good (bad token, run already recorded): dropped, not retried forever.
+  busy.refuseStatus = 401;
+  await until(w, () => lines.some((l) => l.includes("dropped")));
+  assert.equal(w.entries().length, 0, "a refused result isn't kept");
+  assert.equal(busy.results.length, 0, "it never got in");
+  busy.refuseResults = false;
+  await w.tick();
+  assert.equal(busy.results.length, 0, "a dropped result isn't handed in again later");
+});
+
+test("one broken entry doesn't stop the round or hide it", async () => {
+  const hub = fakeHub();
+  // A second, real job that must still get its turn after the broken one blows up: node itself runs anywhere.
+  const script = said("fine.cjs", `console.log("好的")`);
+  const second = job({ command: [process.execPath, script] });
+  hub.jobs.push(second);
+  const lines: string[] = [];
+  const w = worker(hub, { log: (line: string) => lines.push(line) });
+  // An entry whose dir is gone: writing its context fails inside check's try, and the failure report that catch
+  // writes can't be saved either (its path is just as gone), so the error escapes to the round's guard — logged,
+  // kept on disk for later, and the round moves on to the living entry.
+  const dir = join(home, "worker", "runs", "999-1");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "entry.json"),
+    JSON.stringify({
+      ...job(),
+      run: 999,
+      token: "orphan-token",
+      dir: join(home, "worker", "runs", "gone-1"),
+      turn: 0,
+      prompt: "",
+    }),
+  );
+  await w.tick();
+  assert.ok(
+    lines.some((l) => l.startsWith("run 999")),
+    "the broken entry is said so in the log",
+  );
+  assert.ok(!hub.results.some((r) => r.run === 999), "its failure never got made up and handed in");
+  await until(w, () => hub.results.some((r) => r.run === second.run));
+  assert.equal(hub.results.find((r) => r.run === second.run)!.outcome, "done");
+  assert.match(hub.results.find((r) => r.run === second.run)!.summary ?? "", /好的/);
 });

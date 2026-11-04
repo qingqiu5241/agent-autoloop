@@ -348,7 +348,8 @@ test("a failed run's receipt tells the owner but changes nothing else: it will r
     receipt.rejected.map((r) => r.reason),
     ["没跑成的一轮只能发通知", "没跑成的一轮只能发通知", "没跑成的一轮只能发通知"],
   );
-  // The same notice when it fails again isn't told again; a new one is. And a failure with its own notice isn't also told as a failure.
+  // The same notice when it fails again isn't told again; a new one is. Only on the third failure in a row is the
+  // owner also told that it keeps failing — even then, so a failure that always brings its own words can't go quiet.
   for (const n of [1, 2]) {
     job = claim("w1", at(70 * n))!;
     assert.equal(job.run, seen);
@@ -368,7 +369,7 @@ test("a failed run's receipt tells the owner but changes nothing else: it will r
   }
   assert.deepEqual(
     told().map((m) => m.title),
-    ["要你批准", "还要"],
+    ["要你批准", "还要", "意见"],
   );
 });
 
